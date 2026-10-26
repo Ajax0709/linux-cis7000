@@ -187,6 +187,11 @@ static inline int fair_policy(int policy)
 	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
 }
 
+static inline int eevdf_policy(int policy)
+{
+	return policy == SCHED_EEVDF;
+}
+
 static inline int rt_policy(int policy)
 {
 	return policy == SCHED_FIFO || policy == SCHED_RR;
@@ -199,7 +204,7 @@ static inline int dl_policy(int policy)
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
-		rt_policy(policy) || dl_policy(policy);
+		rt_policy(policy) || dl_policy(policy) || eevdf_policy(policy);
 }
 
 static inline int task_has_idle_policy(struct task_struct *p)
@@ -539,6 +544,23 @@ do {									\
 #endif
 # define u64_u32_load(var)      u64_u32_load_copy(var, var##_copy)
 # define u64_u32_store(var, val) u64_u32_store_copy(var, var##_copy, val)
+
+#define EEVDF_DEFAULT_SLICE	(750 * NSEC_PER_USEC)
+#define EEVDF_MIN_SLICE		(100 * NSEC_PER_USEC)
+#define EEVDF_MAX_SLICE		(100 * NSEC_PER_MSEC)
+
+struct eevdf_rq {
+	struct rb_root_cached	tasks_timeline;
+	struct sched_eevdf_entity *curr;
+	u64			min_vruntime;
+	s64			avg_vruntime;
+	u64			avg_load;
+	unsigned int		nr_running;
+#ifdef CONFIG_SCHED_CORE
+	u64			min_vruntime_fi;
+	unsigned int		forceidle_seq;
+#endif
+};
 
 /* CFS-related fields in a runqueue */
 struct cfs_rq {
@@ -991,6 +1013,7 @@ struct rq {
 #endif
 
 	struct cfs_rq		cfs;
+	struct eevdf_rq		eevdf;
 	struct rt_rq		rt;
 	struct dl_rq		dl;
 
@@ -2311,6 +2334,7 @@ extern const struct sched_class stop_sched_class;
 extern const struct sched_class dl_sched_class;
 extern const struct sched_class rt_sched_class;
 extern const struct sched_class fair_sched_class;
+extern const struct sched_class eevdf_sched_class;
 extern const struct sched_class idle_sched_class;
 
 static inline bool sched_stop_runnable(struct rq *rq)
@@ -2821,6 +2845,14 @@ static inline void resched_latency_warn(int cpu, u64 latency) {}
 #endif /* CONFIG_SCHED_DEBUG */
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+extern void init_eevdf_rq(struct eevdf_rq *eevdf_rq);
+extern void init_eevdf_entity(struct task_struct *p);
+extern void set_eevdf_slice(struct task_struct *p, u64 slice);
+#ifdef CONFIG_SCHED_CORE
+extern bool eevdf_prio_less(const struct task_struct *a,
+			    const struct task_struct *b, bool in_fi);
+extern void eevdf_vruntime_update(struct rq *rq, bool in_fi);
+#endif
 extern void init_rt_rq(struct rt_rq *rt_rq);
 extern void init_dl_rq(struct dl_rq *dl_rq);
 

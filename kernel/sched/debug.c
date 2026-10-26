@@ -813,6 +813,9 @@ do {									\
 #undef P
 
 	print_cfs_stats(m, cpu);
+	SEQ_printf(m, "\neevdf_rq[%d]:\n", cpu);
+	SEQ_printf(m, "  .nr_running                    : %u\n", rq->eevdf.nr_running);
+	SEQ_printf(m, "  .min_vruntime                  : %llu\n", rq->eevdf.min_vruntime);
 	print_rt_stats(m, cpu);
 	print_dl_stats(m, cpu);
 
@@ -1089,6 +1092,12 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 #endif
 	P(policy);
 	P(prio);
+	if (eevdf_policy(p->policy)) {
+		P(eevdf.slice);
+		P(eevdf.vruntime);
+		P(eevdf.deadline);
+		P(eevdf.vlag);
+	}
 	if (task_has_dl_policy(p)) {
 		P(dl.runtime);
 		P(dl.deadline);

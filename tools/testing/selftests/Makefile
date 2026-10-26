@@ -69,6 +69,7 @@ TARGETS += riscv
 TARGETS += rlimits
 TARGETS += rseq
 TARGETS += rtc
+TARGETS += sched_eevdf
 TARGETS += seccomp
 TARGETS += sgx
 TARGETS += sigaltstack

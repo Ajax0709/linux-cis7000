@@ -34,7 +34,7 @@ struct sched_param {
  *  @size		size of the structure, for fwd/bwd compat.
  *
  *  @sched_policy	task's scheduling policy
- *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
+ *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH/EEVDF)
  *  @sched_priority	task's static priority (SCHED_FIFO/RR)
  *
  * Certain more advanced scheduling features can be controlled by a
@@ -70,9 +70,9 @@ struct sched_param {
  * and policies, that can be used to ensure all the tasks will make their
  * timing constraints.
  *
- * As of now, the SCHED_DEADLINE policy (sched_dl scheduling class) is the
- * only user of this new interface. More information about the algorithm
- * available in the scheduling class file or in Documentation/.
+ * SCHED_EEVDF uses sched_runtime as its requested slice, in nanoseconds;
+ * zero selects the default slice. sched_deadline and sched_period must be
+ * zero for SCHED_EEVDF. This does not provide real-time guarantees.
  *
  * Task Utilization Attributes
  * ===========================
@@ -105,14 +105,15 @@ struct sched_attr {
 	__u32 sched_policy;
 	__u64 sched_flags;
 
-	/* SCHED_NORMAL, SCHED_BATCH */
+	/* SCHED_NORMAL, SCHED_BATCH, SCHED_EEVDF */
 	__s32 sched_nice;
 
 	/* SCHED_FIFO, SCHED_RR */
 	__u32 sched_priority;
 
-	/* SCHED_DEADLINE */
+	/* SCHED_DEADLINE runtime, or SCHED_EEVDF slice */
 	__u64 sched_runtime;
+	/* SCHED_DEADLINE */
 	__u64 sched_deadline;
 	__u64 sched_period;
 

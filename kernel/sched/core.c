@@ -166,6 +166,8 @@ static inline int __task_prio(const struct task_struct *p)
 
 	if (p->sched_class == &idle_sched_class)
 		return MAX_RT_PRIO + NICE_WIDTH; /* 140 */
+	if (p->sched_class == &eevdf_sched_class)
+		return MAX_RT_PRIO + MAX_NICE + 1;
 
 	return MAX_RT_PRIO + MAX_NICE; /* 120, squash fair */
 }
@@ -195,6 +197,8 @@ static inline bool prio_less(const struct task_struct *a,
 
 	if (pa == MAX_RT_PRIO + MAX_NICE)	/* fair */
 		return cfs_prio_less(a, b, in_fi);
+	if (pa == MAX_RT_PRIO + MAX_NICE + 1)
+		return eevdf_prio_less(a, b, in_fi);
 
 	return false;
 }
@@ -1221,8 +1225,12 @@ bool sched_can_stop_tick(struct rq *rq)
 	if (fifo_nr_running)
 		return true;
 
+	/* A singleton EEVDF task may compete with an incompatible SMT sibling. */
+	if (rq->eevdf.nr_running && sched_core_enabled(rq))
+		return false;
+
 	/*
-	 * If there are no DL,RR/FIFO tasks, there must only be CFS tasks left;
+	 * With no DL/RR/FIFO tasks, CFS and EEVDF tasks remain;
 	 * if there's more than one we need the tick for involuntary
 	 * preemption.
 	 */
@@ -4494,6 +4502,7 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
+	init_eevdf_entity(p);
 
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
@@ -4745,10 +4754,12 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+		if (task_has_dl_policy(p) || task_has_rt_policy(p) ||
+		    eevdf_policy(p->policy)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
+			set_eevdf_slice(p, 0);
 		} else if (PRIO_TO_NICE(p->static_prio) < 0)
 			p->static_prio = NICE_TO_PRIO(0);
 
@@ -4766,6 +4777,8 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		return -EAGAIN;
 	else if (rt_prio(p->prio))
 		p->sched_class = &rt_sched_class;
+	else if (eevdf_policy(p->policy))
+		p->sched_class = &eevdf_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
 
@@ -6007,17 +6020,20 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	 * higher scheduling class, because otherwise those lose the
 	 * opportunity to pull in more work from other CPUs.
 	 */
-	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+	if (likely((prev->sched_class == &fair_sched_class ||
+		    prev->sched_class == &idle_sched_class) &&
 		   rq->nr_running == rq->cfs.h_nr_running)) {
 
 		p = pick_next_task_fair(rq, prev, rf);
 		if (unlikely(p == RETRY_TASK))
 			goto restart;
 
-		/* Assume the next prioritized class is idle_sched_class */
+		/* A lower class may have become runnable while fair dropped the lock. */
 		if (!p) {
 			put_prev_task(rq, prev);
-			p = pick_next_task_idle(rq);
+			p = eevdf_sched_class.pick_next_task(rq);
+			if (!p)
+				p = pick_next_task_idle(rq);
 		}
 
 		return p;
@@ -6069,6 +6085,14 @@ static inline struct task_struct *pick_task(struct rq *rq)
 }
 
 extern void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi);
+
+static void core_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi)
+{
+	if (p->sched_class == &eevdf_sched_class)
+		eevdf_vruntime_update(rq, in_fi);
+	else
+		task_vruntime_update(rq, p, in_fi);
+}
 
 static void queue_core_balance(struct rq *rq);
 
@@ -6170,7 +6194,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			 * unconstrained picks as well.
 			 */
 			WARN_ON_ONCE(fi_before);
-			task_vruntime_update(rq, next, false);
+			core_vruntime_update(rq, next, false);
 			goto out_set_next;
 		}
 	}
@@ -6270,7 +6294,8 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 		 *  1            1       0
 		 */
 		if (!(fi_before && rq->core->core_forceidle_count))
-			task_vruntime_update(rq_i, rq_i->core_pick, !!rq->core->core_forceidle_count);
+			core_vruntime_update(rq_i, rq_i->core_pick,
+					     !!rq->core->core_forceidle_count);
 
 		rq_i->core_pick->core_occupation = occ;
 
@@ -7041,6 +7066,8 @@ static void __setscheduler_prio(struct task_struct *p, int prio)
 		p->sched_class = &dl_sched_class;
 	else if (rt_prio(prio))
 		p->sched_class = &rt_sched_class;
+	else if (eevdf_policy(p->policy))
+		p->sched_class = &eevdf_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
 
@@ -7523,11 +7550,16 @@ static void __setscheduler_params(struct task_struct *p,
 	if (policy == SETPARAM_POLICY)
 		policy = p->policy;
 
+	if (eevdf_policy(policy)) {
+		if (!eevdf_policy(p->policy))
+			init_eevdf_entity(p);
+		set_eevdf_slice(p, attr->sched_runtime);
+	}
 	p->policy = policy;
 
 	if (dl_policy(policy))
 		__setparam_dl(p, attr);
-	else if (fair_policy(policy))
+	else if (fair_policy(policy) || eevdf_policy(policy))
 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
 
 	/*
@@ -7565,11 +7597,15 @@ static int user_check_sched_setscheduler(struct task_struct *p,
 					 const struct sched_attr *attr,
 					 int policy, int reset_on_fork)
 {
-	if (fair_policy(policy)) {
+	if (fair_policy(policy) || eevdf_policy(policy)) {
 		if (attr->sched_nice < task_nice(p) &&
 		    !is_nice_reduction(p, attr->sched_nice))
 			goto req_priv;
 	}
+
+	/* This experimental flat class does not enforce CPU cgroup bandwidth. */
+	if (eevdf_policy(policy) && !eevdf_policy(p->policy))
+		goto req_priv;
 
 	if (rt_policy(policy)) {
 		unsigned long rlim_rtprio = task_rlimit(p, RLIMIT_RTPRIO);
@@ -7650,10 +7686,21 @@ recheck:
 	if (attr->sched_flags & ~(SCHED_FLAG_ALL | SCHED_FLAG_SUGOV))
 		return -EINVAL;
 
+	if (eevdf_policy(policy) && !(attr->sched_flags & SCHED_FLAG_KEEP_PARAMS)) {
+		if (attr->sched_deadline || attr->sched_period)
+			return -EINVAL;
+		if (attr->sched_runtime &&
+		    (attr->sched_runtime < EEVDF_MIN_SLICE ||
+		     attr->sched_runtime > EEVDF_MAX_SLICE))
+			return -EINVAL;
+	}
+	if (eevdf_policy(policy) && (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP))
+		return -EOPNOTSUPP;
+
 	/*
 	 * Valid priorities for SCHED_FIFO and SCHED_RR are
 	 * 1..MAX_RT_PRIO-1, valid priority for SCHED_NORMAL,
-	 * SCHED_BATCH and SCHED_IDLE is 0.
+	 * SCHED_BATCH, SCHED_IDLE and SCHED_EEVDF is 0.
 	 */
 	if (attr->sched_priority > MAX_RT_PRIO-1)
 		return -EINVAL;
@@ -7713,7 +7760,11 @@ recheck:
 	 * but store a possible modification of reset_on_fork.
 	 */
 	if (unlikely(policy == p->policy)) {
-		if (fair_policy(policy) && attr->sched_nice != task_nice(p))
+		if ((fair_policy(policy) || eevdf_policy(policy)) &&
+		    attr->sched_nice != task_nice(p))
+			goto change;
+		if (eevdf_policy(policy) &&
+		    (attr->sched_runtime ?: EEVDF_DEFAULT_SLICE) != p->eevdf.slice)
 			goto change;
 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
 			goto change;
@@ -7865,6 +7916,11 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		policy &= ~SCHED_RESET_ON_FORK;
 		attr.sched_policy = policy;
 	}
+
+	/* Legacy sched_setparam()/setscheduler() cannot specify a slice. */
+	if ((policy == SETPARAM_POLICY || eevdf_policy(policy)) &&
+	    eevdf_policy(p->policy))
+		attr.sched_runtime = READ_ONCE(p->eevdf.slice);
 
 	return __sched_setscheduler(p, &attr, check, true);
 }
@@ -8041,6 +8097,8 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
 		attr->sched_priority = p->rt_priority;
 	else
 		attr->sched_nice = task_nice(p);
+	if (eevdf_policy(p->policy))
+		attr->sched_runtime = p->eevdf.slice;
 }
 
 /**
@@ -9048,6 +9106,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 		ret = MAX_RT_PRIO-1;
 		break;
 	case SCHED_DEADLINE:
+	case SCHED_EEVDF:
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
@@ -9075,6 +9134,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 		ret = 1;
 		break;
 	case SCHED_DEADLINE:
+	case SCHED_EEVDF:
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
@@ -9914,7 +9974,8 @@ void __init sched_init(void)
 	int i;
 
 	/* Make sure the linker didn't screw up */
-	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
+	BUG_ON(&idle_sched_class != &eevdf_sched_class + 1 ||
+	       &eevdf_sched_class != &fair_sched_class + 1 ||
 	       &fair_sched_class != &rt_sched_class + 1 ||
 	       &rt_sched_class   != &dl_sched_class + 1);
 #ifdef CONFIG_SMP
@@ -9981,6 +10042,7 @@ void __init sched_init(void)
 		rq->calc_load_active = 0;
 		rq->calc_load_update = jiffies + LOAD_FREQ;
 		init_cfs_rq(&rq->cfs);
+		init_eevdf_rq(&rq->eevdf);
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
 #ifdef CONFIG_FAIR_GROUP_SCHED
